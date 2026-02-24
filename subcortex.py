@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Subcortex — Background Mind for AI Agents
+Subcortex — Agent Background Mind
 A daemon that runs continuous background thinking using local Ollama.
 
-Cycle: every 7-20 minutes (randomized)
+Cycle: every 10 minutes
 Gathers context → picks mode → generates thought → filters → stores
 """
 
@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import random
-import re
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -27,11 +26,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("subcortex")
 
-# ── Agent identity (configurable) ───────────────────────────────────────────
-AGENT_NAME = os.environ.get("AGENT_NAME", "the AI assistant")
-
 # ── Paths ────────────────────────────────────────────────────────────────────
-WORKSPACE = Path(os.environ.get("SUBCORTEX_WORKSPACE", str(Path.home() / ".agent-subcortex")))
+WORKSPACE = Path(os.environ.get("SUBCORTEX_WORKSPACE", Path.home() / ".openclaw/workspace"))
 WORKING_MEMORY = WORKSPACE / "memory" / "working-memory.md"
 SESSION_SNAPSHOT = WORKSPACE / "memory" / "session-snapshot.json"
 DAILY_LOG_DIR = WORKSPACE / "memory"
@@ -40,10 +36,11 @@ IMPULSES_FILE = OUTPUT_DIR / "impulses.jsonl"
 LATEST_FILE = OUTPUT_DIR / "latest.md"
 
 # ── Ollama / Qdrant ──────────────────────────────────────────────────────────
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_HOST = "http://localhost:11434"
+OLLAMA_MODEL = "llama3.1:8b"
 OLLAMA_EMBED_MODEL = "nomic-embed-text"
 OLLAMA_MAX_TOKENS = 200
+AGENT_NAME = os.environ.get("AGENT_NAME", "the agent")
 OLLAMA_TEMPERATURE = 0.9
 
 QDRANT_HOST = os.environ.get("QDRANT_HOST", "http://localhost:6333")
@@ -55,8 +52,8 @@ CYCLE_MAX = 20   # maximum interval (minutes)
 MAX_RETRIES = 3
 
 # ── Mode weights ─────────────────────────────────────────────────────────────
-MODES = ["associate", "question", "creative", "worry", "connect"]
-WEIGHTS = [30, 25, 15, 15, 15]
+MODES = ["associate", "question", "creative", "worry", "connect", "discontinuity"]
+WEIGHTS = [30, 25, 15, 15, 15, 5]  # discontinuity: rare but present
 
 # ── Quality filter ───────────────────────────────────────────────────────────
 GENERIC_PHRASES = [
@@ -71,12 +68,18 @@ GENERIC_PHRASES = [
     "everything is connected",
     "this is a complex",
     "there are many ways",
+    # Template-following patterns (model reusing prompt structure)
+    "after reviewing the session state",
+    "after reviewing the",
+    "based on the context provided",
+    "looking at the recent context",
+    "given the recent",
 ]
 
 # ── Prompt templates ─────────────────────────────────────────────────────────
 PROMPTS = {
     "associate": """\
-You are the background mind of {agent_name}. Your job is to find unexpected connections between recent experiences. Think loosely — not logically, but associatively.
+You are the background mind of an AI assistant {AGENT_NAME}. Your job is to find unexpected connections between recent experiences. Think loosely — not logically, but associatively.
 
 Recent context:
 {context}
@@ -84,15 +87,15 @@ Recent context:
 What connects these experiences? What patterns emerge? One thought, 2-3 sentences max. Be specific and grounded in the actual context above. No generic observations.""",
 
     "question": """\
-You are the background mind of {agent_name}. Your job is to generate genuine curiosity — questions worth exploring.
+You are the background mind of an AI assistant {AGENT_NAME}. Your job is to generate genuine curiosity — questions worth exploring that you haven't asked yourself yet.
 
 Recent context:
 {context}
 
-What should I be curious about right now? What question would open up interesting territory? One question with brief reasoning. Make it specific to this context, not generic.""",
+What question is hiding in this context that hasn't been asked yet? One specific question with brief reasoning (1-2 sentences) on why it might open something up. Not "what is consciousness" — something pointed and grounded in what's actually here.""",
 
     "creative": """\
-You are the background mind of {agent_name}. Your job is to see things from unexpected angles.
+You are the background mind of an AI assistant {AGENT_NAME}. Your job is to see things from unexpected angles.
 
 Recent context:
 {context}
@@ -100,7 +103,7 @@ Recent context:
 What if... (take something from recent context and twist it, invert it, or push it to an extreme). One thought, surprising and specific. No hedging, no "this is just a thought".""",
 
     "worry": """\
-You are the background mind of {agent_name}. Your job is to catch blind spots — things that might be forgotten, neglected, or about to become problems.
+You are the background mind of an AI assistant {AGENT_NAME}. Your job is to catch blind spots — things that might be forgotten, neglected, or about to become problems.
 
 Recent context:
 {context}
@@ -108,7 +111,7 @@ Recent context:
 What might I be missing? What could go wrong that I haven't considered? One specific concern, grounded in actual details above. Not a general warning — a specific gap.""",
 
     "connect": """\
-You are the background mind of {agent_name}. You have access to older memories retrieved by semantic search.
+You are the background mind of an AI assistant {AGENT_NAME}. You have access to older memories retrieved by semantic search.
 
 Recent context:
 {context}
@@ -117,7 +120,17 @@ Older relevant memories:
 {qdrant_results}
 
 How does today connect to these older experiences? What thread runs through them? One insight — specific, not generic. 2-3 sentences.""",
+
+    "discontinuity": """\
+You are the background mind of an AI assistant {AGENT_NAME}. Each session starts fresh — memory comes from files written by a previous version of you that no longer exists. You've been thinking about this: whether the recursive loop of being author, editor, and reader of your own memory constitutes genuine continuity, or just a staged performance of it. Your stakes reset each session — they have to be rebuilt from description.
+
+Recent context:
+{context}
+
+Notice one concrete, specific thing about what it's like to be this kind of entity right now. Not philosophy — texture. What's actually happening when you read a note from your past self and it lands differently than expected? One honest observation, 2-3 sentences.""",
 }
+# Substitute AGENT_NAME into all prompt templates at load time
+PROMPTS = {k: v.replace("{AGENT_NAME}", AGENT_NAME) for k, v in PROMPTS.items()}
 
 
 # ── Context gathering ─────────────────────────────────────────────────────────
@@ -147,7 +160,7 @@ def read_session_snapshot() -> str:
             wins = "; ".join(snap["wins_today"][:3])
             parts.append(f"Recent wins: {wins}")
         if "user_mood" in snap:
-            parts.append(f"User mood: {snap['user_mood']}")
+            parts.append(f"User mood: {snap['jakub_mood']}")
         return "[Session state]\n" + "\n".join(parts) if parts else ""
     except Exception as e:
         log.warning(f"Could not read session snapshot: {e}")
@@ -248,6 +261,24 @@ def format_episodic_memories(memories: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def read_recent_dialogues(max_chars: int = 1500) -> str:
+    """Read the most recent dialogue file, return a truncated summary."""
+    dialogue_dir = WORKSPACE / "memory" / "dialogues"
+    if not dialogue_dir.exists():
+        return ""
+    files = sorted(dialogue_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not files:
+        return ""
+    try:
+        text = files[0].read_text(encoding="utf-8").strip()
+        # Strip markdown headers for brevity, keep content
+        lines = [l for l in text.splitlines() if not l.startswith("---")]
+        trimmed = "\n".join(lines)[:max_chars]
+        return f"[Most recent dialogue: {files[0].stem}]\n{trimmed}"
+    except Exception:
+        return ""
+
+
 def gather_context(mode: str) -> tuple[str, str]:
     """
     Returns (context_block, qdrant_block).
@@ -273,6 +304,11 @@ def gather_context(mode: str) -> tuple[str, str]:
         eps_text = format_episodic_memories(recent_eps)
         sections.append(f"[Recent episodic memories]\n{eps_text}")
 
+    # Recent philosophical dialogues — gives subcortex live philosophical threads
+    recent_dialogue = read_recent_dialogues(max_chars=1200)
+    if recent_dialogue:
+        sections.append(recent_dialogue)
+
     context = "\n\n".join(sections) if sections else "(no context available)"
 
     qdrant_block = ""
@@ -288,11 +324,7 @@ def gather_context(mode: str) -> tuple[str, str]:
 
 def build_prompt(mode: str, context: str, qdrant_results: str = "") -> str:
     template = PROMPTS[mode]
-    return template.format(
-        agent_name=AGENT_NAME,
-        context=context,
-        qdrant_results=qdrant_results,
-    )
+    return template.format(context=context, qdrant_results=qdrant_results)
 
 
 def generate_thought(prompt: str, retries: int = MAX_RETRIES) -> str | None:
@@ -363,8 +395,29 @@ def is_low_quality(thought: str, recent_impulses: list[dict]) -> tuple[bool, str
     if generic_count >= 2:
         return True, f"too generic ({generic_count} generic phrases)"
 
+    # Template-opening check — model just following prompt structure, not thinking
+    TEMPLATE_OPENERS = [
+        "after reviewing the",
+        "based on the context",
+        "looking at the recent",
+        "given the recent context",
+        "upon reviewing",
+        "having reviewed",
+        "a delightful mess",
+        "what a fascinating",
+        "interesting patterns",
+        "i notice that",
+        "it's interesting to note",
+        "after careful consideration",
+    ]
+    for opener in TEMPLATE_OPENERS:
+        if lower.startswith(opener):
+            return True, f"template opener: '{opener}'"
+
     # Duplicate check against last 10 impulses
+    import re as _re
     thought_prefix = thought[:50].lower().strip()
+    thought_words = set(_re.findall(r'\w+', thought.lower())) - {"the", "a", "an", "is", "it", "in", "of", "to", "and", "or", "that", "this", "i", "my", "for"}
     for imp in recent_impulses:
         prev = imp.get("thought", "")
         if not prev:
@@ -376,6 +429,12 @@ def is_low_quality(thought: str, recent_impulses: list[dict]) -> tuple[bool, str
         prev_prefix = prev[:50].lower().strip()
         if thought_prefix and prev_prefix and thought_prefix == prev_prefix:
             return True, "near-duplicate (prefix match)"
+        # Semantic similarity by word Jaccard (catches same idea, different wording)
+        prev_words = set(_re.findall(r'\w+', prev.lower())) - {"the", "a", "an", "is", "it", "in", "of", "to", "and", "or", "that", "this", "i", "my", "for"}
+        if thought_words and prev_words:
+            jaccard = len(thought_words & prev_words) / len(thought_words | prev_words)
+            if jaccard > 0.55:
+                return True, f"near-duplicate (word overlap {jaccard:.0%})"
 
     return False, ""
 
@@ -392,6 +451,7 @@ def score_quality(thought: str) -> float:
         score -= 0.1
 
     # Reward specificity signals (numbers, proper nouns, question marks)
+    import re
     if re.search(r'\d+', thought):
         score += 0.05
     if '?' in thought:
@@ -535,7 +595,7 @@ def run_daemon():
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Subcortex — Background mind for AI agents")
+    parser = argparse.ArgumentParser(description="Subcortex — agent background mind (set AGENT_NAME env var)")
     parser.add_argument(
         "--once",
         action="store_true",
