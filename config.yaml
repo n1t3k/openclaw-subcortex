@@ -1,0 +1,52 @@
+# Subcortex Configuration
+# All settings can be overridden via environment variables (see README).
+
+ollama:
+  host: http://localhost:11434
+  model: llama3.1:8b
+  max_tokens: 200
+  temperature: 0.9
+
+cycle:
+  min_minutes: 7
+  max_minutes: 20
+  max_retries: 3
+
+modes:
+  associate:
+    weight: 30
+    description: "Find unexpected connections between recent experiences"
+  question:
+    weight: 25
+    description: "Generate genuine curiosity — questions worth exploring"
+  creative:
+    weight: 15
+    description: "See things from unexpected angles (what if...)"
+  worry:
+    weight: 15
+    description: "Catch blind spots and things about to become problems"
+  connect:
+    weight: 15
+    description: "Link today's context to older memories via Qdrant"
+
+quality:
+  min_score: 0.4
+  duplicate_window_hours: 24
+  similarity_threshold: 0.85  # reject if too similar to input
+
+paths:
+  # Override with SUBCORTEX_WORKSPACE env var
+  workspace: ~/.agent-subcortex
+  working_memory: memory/working-memory.md
+  session_snapshot: memory/session-snapshot.json
+  daily_log_dir: memory/
+  output_dir: memory/subconscious/
+  impulses_file: memory/subconscious/impulses.jsonl
+  latest_file: memory/subconscious/latest.md
+
+qdrant:
+  # Override with QDRANT_HOST env var
+  host: localhost
+  port: 6333
+  episodic_collection: agent-episodic   # override: QDRANT_EPISODIC_COLLECTION
+  semantic_collection: agent-memory     # (reserved for future use)
